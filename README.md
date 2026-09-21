@@ -1,118 +1,88 @@
 # gh-proxy
 
-## 简介
+自建 Cloudflare Worker 镜像 GitHub API。
 
-github release、archive以及项目文件的加速项目，支持clone，有Cloudflare Workers无服务器版本以及Python版本
+## 1. 简介
 
-## 演示
+### 1.1 痛点
 
-[https://gh.api.99988866.xyz/](https://gh.api.99988866.xyz/)
+HACS 商店的核心数据（仓库列表、搜索、下载地址）来自 GitHub：
 
-演示站为公共服务，如有大规模使用需求请自行部署，演示站有点不堪重负
+- `api.github.com` —— 商店数据 API
+- `github.com` / `codeload.github.com` —— 下载集成源码
+- `raw.githubusercontent.com` —— 前端插件资源
 
-![imagea272c95887343279.png](https://img.maocdn.cn/img/2021/04/24/imagea272c95887343279.png)
+国内直连 github 的问题：DNS 污染、真实 IP 限速（实测 18~41KB/s）、大文件 60s 超时。官方版 HACS 商店内下载就是直连，所以慢。
 
-当然也欢迎[捐赠](#捐赠)以支持作者
+### 1.2 Cloudflare Worker 是什么
 
-## python版本和cf worker版本差异
+**Cloudflare Worker = 跑在 Cloudflare 全球边缘节点上的 JavaScript 程序**（基于 V8 引擎，无服务器）。
 
-- python版本支持进行文件大小限制，超过设定返回原地址 [issue #8](https://github.com/hunshcn/gh-proxy/issues/8)
+- 请求到达**离用户最近的 Cloudflare 边缘节点**时，你的 JS 代码被执行；
+- 代码里可以用 `fetch()` 去任何地址**回源**，拿到响应后加工再返回——这就是**反向代理**；
+- 对客户端来说完全透明：HA 请求的是 `https://gh-proxy.idooo.dpdns.org/api/...`，收到的响应与直接请求 `api.github.com` 一模一样（Worker 只是中间转了一次手）。
 
-- python版本支持特定user/repo 封禁/白名单 以及passby [issue #41](https://github.com/hunshcn/gh-proxy/issues/41)
+**快在哪**（三点）：
 
-## 使用
+1. Cloudflare 边缘 IP（104.21.x / 172.67.x）国内可直连，不像 github 的 IP 被墙/污染/限速；
+1. Cloudflare ↔ GitHub 之间的骨干链路质量好、速度快；
+1. 免费额度 10 万次请求/天，HACS 的 API 调用量远用不完。
 
-直接在copy出来的url前加`https://gh.api.99988866.xyz/`即可
+### 1.3 完整链路（拓扑图）
 
-也可以直接访问，在input输入
-
-***大量使用请自行部署，以上域名仅为演示使用。***
-
-访问私有仓库可以通过
-
-`git clone https://user:TOKEN@ghproxy.com/https://github.com/xxxx/xxxx` [#71](https://github.com/hunshcn/gh-proxy/issues/71)
-
-以下都是合法输入（仅示例，文件不存在）：
-
-- 分支源码：https://github.com/hunshcn/project/archive/master.zip
-
-- release源码：https://github.com/hunshcn/project/archive/v0.1.0.tar.gz
-
-- release文件：https://github.com/hunshcn/project/releases/download/v0.1.0/example.zip
-
-- 分支文件：https://github.com/hunshcn/project/blob/master/filename
-
-- commit文件：https://github.com/hunshcn/project/blob/1111111111111111111111111111/filename
-
-- gist：https://gist.githubusercontent.com/cielpy/351557e6e465c12986419ac5a4dd2568/raw/cmd.py
-
-## cf worker版本部署
-
-首页：https://workers.cloudflare.com
-
-注册，登陆，`Start building`，取一个子域名，`Create a Worker`。
-
-复制 [index.js](https://cdn.jsdelivr.net/gh/hunshcn/gh-proxy@master/index.js)  到左侧代码框，`Save and deploy`。如果正常，右侧应显示首页。
-
-`ASSET_URL`是静态资源的url（实际上就是现在显示出来的那个输入框单页面）
-
-`PREFIX`是前缀，默认（根路径情况为"/"），如果自定义路由为example.com/gh/*，请将PREFIX改为 '/gh/'，注意，少一个杠都会错！
-
-## Python版本部署
-
-### Docker部署
-
-```
-docker run -d --name="gh-proxy-py" \
-  -p 0.0.0.0:80:80 \
-  --restart=always \
-  hunsh/gh-proxy-py:latest
+```mermaid
+flowchart TB
+    subgraph LAN["家庭内网 D-Fake（PVE 环境A）"]
+        HA["HA 容器 host 网络<br/>192.168.31.3<br/>（HACS 商店）"]
+        AGH["AdGuard Home :53<br/>（HA 的 DNS）"]
+        PPD["PaopaoDNS :54<br/>（AGH 唯一上游）"]
+        NIKKI["nikki/mihomo .31.2<br/>fake-ip 池 198.18.0.0/16"]
+        HA -- "① 查 gh-proxy.idooo.dpdns.org" --> AGH
+        AGH -- "② 转发查询" --> PPD
+        PPD -. "③ 未配置时：问 nikki 拿 fake-ip<br/>→ HA 黑洞（❌）" .-> NIKKI
+        PPD -- "④ 命中 force_dnscrypt_list<br/>dnscrypt 加密解析（✅）" --> AGH
+        AGH -- "⑤ 返回真实 IP<br/>104.21.15.237" --> HA
+    end
+    HA -- "⑥ HTTPS 直连<br/>gh-proxy.idooo.dpdns.org/api/..." --> CF
+    subgraph CFNET["Cloudflare 全球边缘网络"]
+        CF["边缘节点<br/>【自建 Worker 跑在这】"]
+    end
+    CF -- "⑦ Worker 改写路径并回源<br/>api/... → api.github.com/..." --> GH["GitHub<br/>api.github.com / github.com"]
+    GH -- "⑧ JSON / 文件响应" --> CF
+    CF -- "⑨ 转发给 HA" --> HA
+    HA -. "对照：官方版直连 github<br/>限速 18~41KB/s（慢）" .-> GH
 ```
 
-第一个80是你要暴露出去的端口
+### 1.4 为什么必须绑自有域名
 
-### 直接部署
+Worker 默认域名 `*.workers.dev` **国内被墙**（SNI 阻断），必须绑定自有域名才能用。
 
-安装依赖（请使用python3）
+- 绑自有域名后走 Cloudflare 通用 Anycast IP（104.21.x / 172.67.x），SNI 是自己的域名，不被墙；
+- 本机用的 `idooo.dpdns.org`（动态 DNS 域名）可用。
+## 2. 实操步骤
 
-```pip install flask requests```
+### 2.1 获取 Worker 代码
 
-按需求修改`app/main.py`的前几项配置
+用 hacs-china 官方仓库的现成代码：<https://github.com/hacs-china/gh-proxy/blob/master/index.js>
 
-*注意:* 可能需要在`return Response`前加两行
-```python3
-if 'Transfer-Encoding' in headers:
-    headers.pop('Transfer-Encoding')
-```
+### 2.2 创建 Worker
 
-### 注意
+1. 登录 Cloudflare → **Workers 和 Pages** → **创建** → **创建 Worker** → 选择 **HTTP 处理程序**；
+1. 把 index.js 全部代码粘贴进编辑器 → **部署**。
 
-python版本的机器如果无法正常访问github.io会启动报错，请自行修改静态文件url
+### 2.3 绑定自有域名
 
-python版本默认走服务器（2021.3.27更新）
+1. 进入 **域**（idooo.dpdns.org）→ **自定义域和路由** → **添加域名**；
+1. 选择 `idooo.dpdns.org`，子域名填 `gh-proxy` → 确定。
 
-## Cloudflare Workers计费
+完成后 DNS 自动生效：`gh-proxy.idooo.dpdns.org` 解析到 Cloudflare 的 104.21.x / 172.67.x。
 
-到 `overview` 页面可参看使用情况。免费版每天有 10 万次免费请求，并且有每分钟1000次请求的限制。
+### 2.4 验证（⚠️ 必须带尾斜杠）
 
-如果不够用，可升级到 $5 的高级版本，每月可用 1000 万次请求（超出部分 $0.5/百万次请求）。
+| 验证地址 | 预期结果 |
+| --- | --- |
+| `https://gh-proxy.idooo.dpdns.org/` | 302 跳转 `github.com/hacs-china` |
+| `https://gh-proxy.idooo.dpdns.org/api/` | 返回 api.github.com 的 JSON 根文档 |
+| `https://gh-proxy.idooo.dpdns.org/api/rate_limit` | 返回真实的 rate_limit JSON |
 
-## Changelog
-
-* 2020.04.10 增加对`raw.githubusercontent.com`文件的支持
-* 2020.04.09 增加Python版本（使用Flask）
-* 2020.03.23 新增了clone的支持
-* 2020.03.22 初始版本
-
-## 链接
-
-[我的博客](https://hunsh.net)
-
-## 参考
-
-[jsproxy](https://github.com/EtherDream/jsproxy/)
-
-## 捐赠
-
-![wx.png](https://img.maocdn.cn/img/2021/04/24/image.md.png)
-![ali.png](https://www.helloimg.com/images/2021/04/24/BK9vmb.md.png)
+验证 `https://gh-proxy.idooo.dpdns.org/api`（**无尾斜杠**）返回 "404 File not found ... GitHub Pages" —— 这是**假警报**！Worker 代码只匹配 `api/` 开头的路径，`/api` 不带斜杠落进兜底分支，转去作者静态站 `hunshcn.github.io/gh-proxy/api` 拿文件，自然 404。三个带斜杠的测试全部通过即说明 Worker 正常。
